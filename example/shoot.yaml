@@ -20,9 +20,9 @@ spec:
       caches:
       - upstream: docker.io
         size: 500Mi
-      - upstream: ghcr.io
-      - upstream: quay.io
-        garbageCollectionEnabled: false
+      # - upstream: ghcr.io
+      # - upstream: quay.io
+      #   garbageCollectionEnabled: false
   networking:
     type: calico
   provider:

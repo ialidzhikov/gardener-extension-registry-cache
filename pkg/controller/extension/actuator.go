@@ -26,16 +26,19 @@ import (
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	"github.com/gardener/gardener/pkg/component"
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/gardener/gardener-extension-registry-cache/pkg/apis/config"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry/v1alpha1"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/component/registrycaches"
+	"github.com/gardener/gardener-extension-registry-cache/pkg/component/registryconfigurationcleaner"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/constants"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/imagevector"
 )
@@ -64,6 +67,54 @@ func (a *actuator) Reconcile(ctx context.Context, _ logr.Logger, ex *extensionsv
 	registryConfig := &v1alpha1.RegistryConfig{}
 	if _, _, err := a.decoder.Decode(ex.Spec.ProviderConfig.Raw, nil, registryConfig); err != nil {
 		return fmt.Errorf("failed to decode provider config: %w", err)
+	}
+
+	// TODO: extension disablement has to be handled in the Delete func
+
+	// Find caches to destroy
+	if ex.Status.ProviderStatus != nil {
+		registryStatus := &v1alpha1.RegistryStatus{}
+		if _, _, err := a.decoder.Decode(ex.Status.ProviderStatus.Raw, nil, registryStatus); err != nil {
+			return fmt.Errorf("failed to decode providerStatus of extension '%s': %w", client.ObjectKeyFromObject(ex), err)
+		}
+
+		existingUpstreams := sets.New[string]()
+		for _, cache := range registryStatus.Caches {
+			existingUpstreams.Insert(cache.Upstream)
+		}
+
+		desiredUpstreams := sets.New[string]()
+		for _, cache := range registryConfig.Caches {
+			desiredUpstreams.Insert(cache.Upstream)
+		}
+
+		upstreamsToDelete := existingUpstreams.Difference(desiredUpstreams)
+		if upstreamsToDelete.Len() > 0 {
+			for _, toDelete := range upstreamsToDelete {
+
+				_ = &appsv1.DaemonSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "foo",
+						Namespace: "kube-system",
+					},
+					Spec: appsv1.DaemonSetSpec{
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:  "pause",
+										Image: "registry.k8s.io/pause:3.7",
+									},
+								},
+							},
+						},
+					},
+				}
+				// TODO: continue from here. Deploy DaemonSet.
+
+				_ = toDelete
+			}
+		}
 	}
 
 	image, err := imagevector.ImageVector().FindImage("registry")
@@ -103,6 +154,27 @@ func (a *actuator) Reconcile(ctx context.Context, _ logr.Logger, ex *extensionsv
 
 // Delete the Extension resource.
 func (a *actuator) Delete(ctx context.Context, _ logr.Logger, ex *extensionsv1alpha1.Extension) error {
+	if ex.Status.ProviderStatus != nil {
+		registryStatus := &v1alpha1.RegistryStatus{}
+		if _, _, err := a.decoder.Decode(ex.Status.ProviderStatus.Raw, nil, registryStatus); err != nil {
+			return fmt.Errorf("failed to decode providerStatus of extension '%s': %w", client.ObjectKeyFromObject(ex), err)
+		}
+
+		for _, cache := range registryStatus.Caches {
+			namespace := ex.GetNamespace()
+			values := registryconfigurationcleaner.Values{Upstream: cache.Upstream}
+			cleaner := registryconfigurationcleaner.New(a.client, namespace, values)
+
+			if err := component.OpWait(cleaner).Deploy(ctx); err != nil {
+				return fmt.Errorf("failed to deploy the registry configuration cleaner component for upstream %s: %w", cache.Upstream, err)
+			}
+
+			if err := component.OpDestroyAndWait(cleaner).Destroy(ctx); err != nil {
+				return fmt.Errorf("failed to destroy the registry configuration cleaner component for upstream %s: %w", cache.Upstream, err)
+			}
+		}
+	}
+
 	namespace := ex.GetNamespace()
 	registryCaches := registrycaches.New(a.client, namespace, registrycaches.Values{})
 
