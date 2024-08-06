@@ -176,6 +176,7 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 	}
 
 	const (
+		containerName            = "registry-cache"
 		registryCacheVolumeName  = "cache-volume"
 		registryConfigVolumeName = "config-volume"
 		debugPort                = 5001
@@ -286,13 +287,13 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 					},
 					Containers: []corev1.Container{
 						{
-							Name:            "registry-cache",
+							Name:            containerName,
 							Image:           r.values.Image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("20m"),
-									corev1.ResourceMemory: resource.MustParse("50Mi"),
+									corev1.ResourceCPU:    resource.MustParse("1m"),
+									corev1.ResourceMemory: resource.MustParse("40Mi"),
 								},
 							},
 							Ports: []corev1.ContainerPort{
@@ -382,8 +383,6 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 
 	var vpa *vpaautoscalingv1.VerticalPodAutoscaler
 	if r.values.VPAEnabled {
-		updateMode := vpaautoscalingv1.UpdateModeAuto
-		controlledValues := vpaautoscalingv1.ContainerControlledValuesRequestsOnly
 		vpa = &vpaautoscalingv1.VerticalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
@@ -395,23 +394,19 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 					Kind:       "StatefulSet",
 					Name:       name,
 				},
-				UpdatePolicy: &vpaautoscalingv1.PodUpdatePolicy{
-					UpdateMode: &updateMode,
-				},
 				ResourcePolicy: &vpaautoscalingv1.PodResourcePolicy{
 					ContainerPolicies: []vpaautoscalingv1.ContainerResourcePolicy{
 						{
 							ContainerName:    vpaautoscalingv1.DefaultContainerResourcePolicy,
-							ControlledValues: &controlledValues,
+							ControlledValues: ptr.To(vpaautoscalingv1.ContainerControlledValuesRequestsOnly),
 							MinAllowed: corev1.ResourceList{
 								corev1.ResourceMemory: resource.MustParse("20Mi"),
 							},
-							MaxAllowed: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("4"),
-								corev1.ResourceMemory: resource.MustParse("8Gi"),
-							},
 						},
 					},
+				},
+				UpdatePolicy: &vpaautoscalingv1.PodUpdatePolicy{
+					UpdateMode: ptr.To(vpaautoscalingv1.UpdateModeAuto),
 				},
 			},
 		}
