@@ -80,7 +80,7 @@ spec:
           protocol: TCP
 {{- if .Values.global.resources }}
         resources:
-{{ toYaml .Values.global.resources | nindent 10 }}
+{{ toYaml .Values.global.resources | indent 10 }}
 {{- end }}
         volumeMounts:
         {{- if .Values.global.kubeconfig }}

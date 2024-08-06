@@ -9,17 +9,18 @@ global:
     pullPolicy: IfNotPresent
 # priorityClassName: gardener-garden-system-400
   replicaCount: 1
-  resources: {}
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
   metricsPort: 8080
   healthPort: 8081
   vpa:
     enabled: true
     resourcePolicy:
+      controlledValues: RequestsOnly
       minAllowed:
-        memory: 64Mi
-      maxAllowed:
-        cpu: 2
-        memory: 2Gi
+        memory: 20Mi
     updatePolicy:
       updateMode: "Auto"
   webhookConfig:
