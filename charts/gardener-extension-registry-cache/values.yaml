@@ -11,16 +11,17 @@ metrics:
 
 resources:
   requests:
+    # TODO: Revise these values depending on the discussion with Vedran.
     cpu: 50m
     memory: 64Mi
+  limits:
+    memory: 3Gi
 vpa:
   enabled: true
   resourcePolicy:
+    controlledValues: RequestsOnly
     minAllowed:
       memory: 32Mi
-    maxAllowed:
-      cpu: 2
-      memory: 2Gi
   updatePolicy:
     updateMode: "Auto"
 

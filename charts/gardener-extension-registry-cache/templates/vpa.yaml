@@ -9,12 +9,15 @@ spec:
   resourcePolicy:
     containerPolicies:
       - containerName: gardener-extension-registry-cache
-        minAllowed:
-          memory: {{ required ".Values.vpa.resourcePolicy.minAllowed.memory is required" .Values.vpa.resourcePolicy.minAllowed.memory }}
-        maxAllowed:
-          cpu: {{ required ".Values.vpa.resourcePolicy.maxAllowed.cpu is required" .Values.vpa.resourcePolicy.maxAllowed.cpu }}
-          memory: {{ required ".Values.vpa.resourcePolicy.maxAllowed.memory is required" .Values.vpa.resourcePolicy.maxAllowed.memory }}
-        controlledValues: RequestsOnly
+        {{- if .Values.vpa.resourcePolicy.controlledValues }}
+        controlledValues: {{ .Values.vpa.resourcePolicy.controlledValues }}
+        {{- end }}
+        {{- with .Values.vpa.resourcePolicy.minAllowed }}
+        minAllowed: {{ toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.vpa.resourcePolicy.maxAllowed }}
+        maxAllowed: {{ toYaml . | nindent 10 }}
+        {{- end }}
   {{- end }}
   targetRef:
     apiVersion: apps/v1
