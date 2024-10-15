@@ -36,11 +36,9 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	vpaautoscalingv1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	api "github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry/helper"
@@ -118,37 +116,25 @@ type registryCaches struct {
 
 // Deploy implements component.DeployWaiter.
 func (r *registryCaches) Deploy(ctx context.Context) error {
-	// TODO(dimitar-kostadinov): If services are previously created with ManagedResource remove service object references from ManagedResource status - remove this after v0.11.0
-	mr := &resourcesv1alpha1.ManagedResource{
-		ObjectMeta: metav1.ObjectMeta{Name: managedResourceName, Namespace: r.namespace},
+	// TODO(dimitar-kostadinov): Clean up this invocation in v0.12.0.
+	if err := r.removeServicesFromManagedResourceStatus(ctx); err != nil {
+		return fmt.Errorf("failed to remove Services from the ManagedResource status: %w", err)
 	}
-	err := r.client.Get(ctx, client.ObjectKeyFromObject(mr), mr)
-	if err != nil && !apierrors.IsNotFound(err) {
+
+	servicesData, err := r.computeResourcesDataForServices()
+	if err != nil {
 		return err
 	}
-	var updatedRefs []resourcesv1alpha1.ObjectReference
-	for _, objectRef := range mr.Status.Resources {
-		if objectRef.Kind != "Service" {
-			updatedRefs = append(updatedRefs, objectRef)
-		}
-	}
-	if len(updatedRefs) != len(mr.Status.Resources) {
-		patch := client.MergeFrom(mr.DeepCopy())
-		mr.Status.Resources = updatedRefs
-		err = r.client.Status().Patch(ctx, mr, patch)
-		if err != nil {
-			return fmt.Errorf("failed to update ManagedResource status: %w", err)
-		}
+
+	if err := managedresources.CreateForShoot(ctx, r.client, r.namespace, "extension-registry-cache-services", "registry-cache", false, servicesData); err != nil {
+		return fmt.Errorf("failed to create ManagedResource for Shoot: %w", err)
 	}
 
-	//create registry cache services
-	if err := r.createServices(ctx); err != nil {
-		return fmt.Errorf("failed to create services: %w", err)
+	if err := managedresources.WaitUntilHealthy(ctx, r.client, r.namespace, "extension-registry-cache-services"); err != nil {
+		return fmt.Errorf("failed to wait ManagedResource to be healthy: %w", err)
 	}
 
-	upstreamsToDelete := r.getUpstreamsToDelete()
-
-	services, err := r.fillProviderStatus(ctx, upstreamsToDelete)
+	services, err := r.fillProviderStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to fill provider status: %w", err)
 	}
@@ -157,10 +143,6 @@ func (r *registryCaches) Deploy(ctx context.Context) error {
 	generatedSecrets, err := extensionssecretsmanager.GenerateAllSecrets(ctx, r.secretManager, secretsConfig)
 	if err != nil {
 		return err
-	}
-
-	if len(r.values.Caches) != len(generatedSecrets)-1 {
-		return fmt.Errorf("not all secrets are generated for configured caches")
 	}
 
 	caSecret, found := r.secretManager.Get(secrets.CAName)
@@ -190,10 +172,6 @@ func (r *registryCaches) Deploy(ctx context.Context) error {
 		return fmt.Errorf("failed to create or update managed resource: %w", err)
 	}
 
-	if err = r.deleteServices(ctx, upstreamsToDelete.UnsortedList()); err != nil {
-		return fmt.Errorf("failed to delete services: %w", err)
-	}
-
 	if err := r.deployMonitoringConfig(ctx); err != nil {
 		return fmt.Errorf("failed to deploy monitoring config: %w", err)
 	}
@@ -207,10 +185,10 @@ func (r *registryCaches) Destroy(ctx context.Context) error {
 		if err := managedresources.SetKeepObjects(ctx, r.client, r.namespace, managedResourceName, true); err != nil {
 			return err
 		}
-	} else {
-		if err := r.deleteAllServices(ctx); err != nil {
-			return err
-		}
+	}
+
+	if err := managedresources.Delete(ctx, r.client, r.namespace, "extension-registry-cache-services", false); err != nil {
+		return err
 	}
 
 	return managedresources.Delete(ctx, r.client, r.namespace, managedResourceName, false)
@@ -232,6 +210,10 @@ func (r *registryCaches) Wait(ctx context.Context) error {
 func (r *registryCaches) WaitCleanup(ctx context.Context) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, TimeoutWaitForManagedResource)
 	defer cancel()
+
+	if err := managedresources.WaitUntilDeleted(timeoutCtx, r.client, r.namespace, "extension-registry-cache-services"); err != nil {
+		return err
+	}
 
 	return managedresources.WaitUntilDeleted(timeoutCtx, r.client, r.namespace, managedResourceName)
 }
@@ -519,75 +501,53 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 	}, nil
 }
 
-func (r *registryCaches) createServices(ctx context.Context) error {
+func (r *registryCaches) computeResourcesDataForServices() (map[string][]byte, error) {
+	var services []client.Object
+
 	for _, cache := range r.values.Caches {
-		upstreamLabel := computeUpstreamLabelValue(cache.Upstream)
-		name := "registry-" + strings.ReplaceAll(upstreamLabel, ".", "-")
-		remoteURL := ptr.Deref(cache.RemoteURL, registryutils.GetUpstreamURL(cache.Upstream))
-		service := &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: metav1.NamespaceSystem,
-			},
-		}
-		op, err := controllerutil.CreateOrUpdate(ctx, r.shootClient, service, func() error {
-			serviceLabels := getLabels(name, upstreamLabel)
-			service.Annotations = map[string]string{
+		service := computeResourcesDataForService(&cache)
+
+		services = append(services, service)
+	}
+
+	registry := managedresources.NewRegistry(kubernetes.ShootScheme, kubernetes.ShootCodec, kubernetes.ShootSerializer)
+
+	return registry.AddAllAndSerialize(services...)
+}
+
+func computeResourcesDataForService(cache *api.RegistryCache) *corev1.Service {
+	var (
+		upstreamLabel = computeUpstreamLabelValue(cache.Upstream)
+		name          = "registry-" + strings.ReplaceAll(upstreamLabel, ".", "-")
+		remoteURL     = ptr.Deref(cache.RemoteURL, registryutils.GetUpstreamURL(cache.Upstream))
+	)
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: metav1.NamespaceSystem,
+			Labels:    getLabels(name, upstreamLabel),
+			Annotations: map[string]string{
 				constants.UpstreamAnnotation:  cache.Upstream,
 				constants.RemoteURLAnnotation: remoteURL,
-			}
-			service.Labels = serviceLabels
-			service.Spec.Selector = serviceLabels
-			service.Spec.Type = corev1.ServiceTypeClusterIP
-			service.Spec.Ports = []corev1.ServicePort{{
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: getLabels(name, upstreamLabel),
+			Ports: []corev1.ServicePort{{
 				Name:       "registry-cache",
 				Port:       constants.RegistryCachePort,
 				Protocol:   corev1.ProtocolTCP,
 				TargetPort: intstr.FromString("registry-cache"),
-			}}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		r.logger.Info("Service successfully reconciled", "operation", op, "upstream", cache.Upstream)
+			}},
+			Type: corev1.ServiceTypeClusterIP,
+		},
 	}
-	return nil
+
+	return service
 }
 
-func (r *registryCaches) deleteServices(ctx context.Context, upstreamsToDelete []string) error {
-	for _, cache := range upstreamsToDelete {
-		upstreamLabel := computeUpstreamLabelValue(cache)
-		name := "registry-" + strings.ReplaceAll(upstreamLabel, ".", "-")
-		if err := r.shootClient.Delete(ctx, &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: metav1.NamespaceSystem,
-			},
-		}); err != nil {
-			if apierrors.IsNotFound(err) {
-				r.logger.Info("Service not found", "upstream", cache)
-				continue
-			}
-			return err
-		}
-		r.logger.Info("Service successfully deleted", "upstream", cache)
-	}
-	return nil
-}
-
-func (r *registryCaches) deleteAllServices(ctx context.Context) error {
-	selector := labels.NewSelector()
-	requirement, err := labels.NewRequirement(constants.UpstreamHostLabel, selection.Exists, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create label selector: %w", err)
-	}
-	selector = selector.Add(*requirement)
-
-	return r.shootClient.DeleteAllOf(ctx, &corev1.Service{}, client.InNamespace(metav1.NamespaceSystem), client.MatchingLabelsSelector{Selector: selector})
-}
-
-func (r *registryCaches) fillProviderStatus(ctx context.Context, upstreamsToDelete sets.Set[string]) ([]corev1.Service, error) {
+func (r *registryCaches) fillProviderStatus(ctx context.Context) ([]corev1.Service, error) {
 	selector := labels.NewSelector()
 	requirement, err := labels.NewRequirement(constants.UpstreamHostLabel, selection.Exists, nil)
 	if err != nil {
@@ -601,20 +561,12 @@ func (r *registryCaches) fillProviderStatus(ctx context.Context, upstreamsToDele
 		return nil, fmt.Errorf("failed to read services from shoot: %w", err)
 	}
 
-	services := serviceList.Items
-	if len(upstreamsToDelete) > 0 {
-		desiredServices := make([]corev1.Service, 0, len(r.values.Caches))
-		for _, service := range serviceList.Items {
-			if upstreamsToDelete.Has(service.Annotations[constants.UpstreamAnnotation]) {
-				continue
-			}
-			desiredServices = append(desiredServices, service)
-		}
-		services = desiredServices
+	if len(serviceList.Items) != len(r.values.Caches) {
+		return nil, fmt.Errorf("not all services for all configured caches exist")
 	}
 
 	cacheStatuses := make([]v1alpha3.RegistryCacheStatus, 0, len(r.values.Caches))
-	for _, service := range services {
+	for _, service := range serviceList.Items {
 		cacheStatuses = append(cacheStatuses, v1alpha3.RegistryCacheStatus{
 			Upstream:  service.Annotations[constants.UpstreamAnnotation],
 			Endpoint:  fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, constants.RegistryCachePort),
@@ -622,29 +574,9 @@ func (r *registryCaches) fillProviderStatus(ctx context.Context, upstreamsToDele
 		})
 	}
 
-	if len(r.values.Caches) != len(cacheStatuses) {
-		return nil, fmt.Errorf("not all services for all configured caches exist")
-	}
-
 	r.values.RegistryStatus.Caches = cacheStatuses
 
-	return services, nil
-}
-
-func (r *registryCaches) getUpstreamsToDelete() sets.Set[string] {
-	upstreams := sets.New[string]()
-	for _, cache := range r.values.Caches {
-		upstreams.Insert(cache.Upstream)
-	}
-
-	upstreamsToDelete := sets.New[string]()
-	for _, cacheStatus := range r.values.CacheStatuses {
-		if !upstreams.Has(cacheStatus.Upstream) {
-			upstreamsToDelete.Insert(cacheStatus.Upstream)
-		}
-	}
-
-	return upstreamsToDelete
+	return serviceList.Items, nil
 }
 
 func getLabels(name, upstreamLabel string) map[string]string {
@@ -678,4 +610,38 @@ func computeUpstreamLabelValue(upstream string) string {
 		upstreamLabel = fmt.Sprintf("%s-%s", upstreamLabel[:limit], hash)
 	}
 	return upstreamLabel
+}
+
+// removeServicesFromManagedResourceStatus removes all resources with kind=Service from the ManagedResources .status.resources field.
+//
+// TODO(dimitar-kostadinov): Clean up this function in v0.12.0.
+func (r *registryCaches) removeServicesFromManagedResourceStatus(ctx context.Context) error {
+	mr := &resourcesv1alpha1.ManagedResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      managedResourceName,
+			Namespace: r.namespace,
+		},
+	}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(mr), mr); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	var updatedRefs []resourcesv1alpha1.ObjectReference
+	for _, objectRef := range mr.Status.Resources {
+		if objectRef.Kind != "Service" {
+			updatedRefs = append(updatedRefs, objectRef)
+		}
+	}
+	if len(updatedRefs) == len(mr.Status.Resources) {
+		// No changes, no need to patch. Exit early.
+		return nil
+	}
+
+	patch := client.MergeFrom(mr.DeepCopy())
+	mr.Status.Resources = updatedRefs
+	if err := r.client.Status().Patch(ctx, mr, patch); err != nil {
+		return fmt.Errorf("failed to update ManagedResource status: %w", err)
+	}
+
+	return nil
 }
