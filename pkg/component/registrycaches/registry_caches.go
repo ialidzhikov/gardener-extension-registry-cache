@@ -18,22 +18,16 @@ import (
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	v1beta1helper "github.com/gardener/gardener/pkg/apis/core/v1beta1/helper"
-	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
 	"github.com/gardener/gardener/pkg/client/kubernetes"
-	"github.com/gardener/gardener/pkg/component"
 	"github.com/gardener/gardener/pkg/utils"
 	kubernetesutils "github.com/gardener/gardener/pkg/utils/kubernetes"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
 	secretsmanager "github.com/gardener/gardener/pkg/utils/secrets/manager"
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	vpaautoscalingv1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -42,7 +36,6 @@ import (
 
 	api "github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry/helper"
-	"github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry/v1alpha3"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/constants"
 	"github.com/gardener/gardener-extension-registry-cache/pkg/secrets"
 	registryutils "github.com/gardener/gardener-extension-registry-cache/pkg/utils/registry"
@@ -72,6 +65,8 @@ type Values struct {
 	Image string
 	// VPAEnabled marks whether VerticalPodAutoscaler is enabled for the shoot.
 	VPAEnabled bool
+
+	Services []corev1.Service
 	// Caches are the registry caches to deploy.
 	Caches []api.RegistryCache
 	// ResourceReferences are the resource references from the Shoot spec (the .spec.resources field).
@@ -80,26 +75,19 @@ type Values struct {
 	// before ManagedResource deletion during the Destroy operation. When set to true, the deployed
 	// resources by ManagedResources won't be deleted, but the ManagedResource itself will be deleted.
 	KeepObjectsOnDestroy bool
-	// CacheStatuses are the registry cache statuses, if any.
-	CacheStatuses []api.RegistryCacheStatus
-	// RegistryStatus is an empty registry status to fill.
-	RegistryStatus *v1alpha3.RegistryStatus
 }
 
 // New creates a new instance of DeployWaiter for registry caches.
-func New(
+func NewComponent(
 	client client.Client,
-	shootClient client.Client,
 	secretManager secretsmanager.Interface,
-	logger logr.Logger,
 	namespace string,
 	values Values,
-) component.DeployWaiter {
+	// TODO: Return a custom interface that extensions compoennt.DeployWaiter and adds the CASecretName func
+) *registryCaches {
 	return &registryCaches{
 		client:        client,
-		shootClient:   shootClient,
 		secretManager: secretManager,
-		logger:        logger,
 		namespace:     namespace,
 		values:        values,
 	}
@@ -107,39 +95,16 @@ func New(
 
 type registryCaches struct {
 	client        client.Client
-	shootClient   client.Client
 	secretManager secretsmanager.Interface
-	logger        logr.Logger
 	namespace     string
 	values        Values
+
+	caSecretName string
 }
 
 // Deploy implements component.DeployWaiter.
 func (r *registryCaches) Deploy(ctx context.Context) error {
-	// TODO(dimitar-kostadinov): Clean up this invocation in v0.12.0.
-	if err := r.removeServicesFromManagedResourceStatus(ctx); err != nil {
-		return fmt.Errorf("failed to remove Services from the ManagedResource status: %w", err)
-	}
-
-	servicesData, err := r.computeResourcesDataForServices()
-	if err != nil {
-		return err
-	}
-
-	if err := managedresources.CreateForShoot(ctx, r.client, r.namespace, "extension-registry-cache-services", "registry-cache", false, servicesData); err != nil {
-		return fmt.Errorf("failed to create ManagedResource for Shoot: %w", err)
-	}
-
-	if err := managedresources.WaitUntilHealthy(ctx, r.client, r.namespace, "extension-registry-cache-services"); err != nil {
-		return fmt.Errorf("failed to wait ManagedResource to be healthy: %w", err)
-	}
-
-	services, err := r.fillProviderStatus(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to fill provider status: %w", err)
-	}
-
-	secretsConfig := secrets.ConfigsFor(services)
+	secretsConfig := secrets.ConfigsFor(r.values.Services)
 	generatedSecrets, err := extensionssecretsmanager.GenerateAllSecrets(ctx, r.secretManager, secretsConfig)
 	if err != nil {
 		return err
@@ -149,7 +114,7 @@ func (r *registryCaches) Deploy(ctx context.Context) error {
 	if !found {
 		return fmt.Errorf("secret %q not found", secrets.CAName)
 	}
-	r.values.RegistryStatus.CASecretName = caSecret.Name
+	r.caSecretName = caSecret.Name
 
 	data, err := r.computeResourcesData(ctx, generatedSecrets)
 	if err != nil {
@@ -187,10 +152,6 @@ func (r *registryCaches) Destroy(ctx context.Context) error {
 		}
 	}
 
-	if err := managedresources.Delete(ctx, r.client, r.namespace, "extension-registry-cache-services", false); err != nil {
-		return err
-	}
-
 	return managedresources.Delete(ctx, r.client, r.namespace, managedResourceName, false)
 }
 
@@ -211,11 +172,11 @@ func (r *registryCaches) WaitCleanup(ctx context.Context) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, TimeoutWaitForManagedResource)
 	defer cancel()
 
-	if err := managedresources.WaitUntilDeleted(timeoutCtx, r.client, r.namespace, "extension-registry-cache-services"); err != nil {
-		return err
-	}
-
 	return managedresources.WaitUntilDeleted(timeoutCtx, r.client, r.namespace, managedResourceName)
+}
+
+func (r *registryCaches) CASecretName() string {
+	return r.caSecretName
 }
 
 func (r *registryCaches) computeResourcesData(ctx context.Context, secrets map[string]*corev1.Secret) (map[string][]byte, error) {
@@ -254,7 +215,7 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 	)
 
 	var (
-		upstreamLabel = computeUpstreamLabelValue(cache.Upstream)
+		upstreamLabel = registryutils.ComputeUpstreamLabelValue(cache.Upstream)
 		name          = "registry-" + strings.ReplaceAll(upstreamLabel, ".", "-")
 		remoteURL     = ptr.Deref(cache.RemoteURL, registryutils.GetUpstreamURL(cache.Upstream))
 		configValues  = map[string]interface{}{
@@ -299,7 +260,7 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + "-config",
 			Namespace: metav1.NamespaceSystem,
-			Labels:    getLabels(name, upstreamLabel),
+			Labels:    registryutils.GetLabels(name, upstreamLabel),
 		},
 		Data: map[string][]byte{
 			"config.yml": configYAML.Bytes(),
@@ -311,7 +272,7 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + "-tls",
 			Namespace: metav1.NamespaceSystem,
-			Labels:    getLabels(name, upstreamLabel),
+			Labels:    registryutils.GetLabels(name, upstreamLabel),
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: secret.Data,
@@ -322,17 +283,17 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: metav1.NamespaceSystem,
-			Labels:    getLabels(name, upstreamLabel),
+			Labels:    registryutils.GetLabels(name, upstreamLabel),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: name,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: getLabels(name, upstreamLabel),
+				MatchLabels: registryutils.GetLabels(name, upstreamLabel),
 			},
 			Replicas: ptr.To(int32(1)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: utils.MergeStringMaps(getLabels(name, upstreamLabel), map[string]string{
+					Labels: utils.MergeStringMaps(registryutils.GetLabels(name, upstreamLabel), map[string]string{
 						v1beta1constants.LabelNetworkPolicyToDNS:            v1beta1constants.LabelNetworkPolicyAllowed,
 						v1beta1constants.LabelNetworkPolicyToPublicNetworks: v1beta1constants.LabelNetworkPolicyAllowed,
 					}),
@@ -439,7 +400,7 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   registryCacheVolumeName,
-						Labels: getLabels(name, upstreamLabel),
+						Labels: registryutils.GetLabels(name, upstreamLabel),
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -499,149 +460,4 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 		statefulSet,
 		vpa,
 	}, nil
-}
-
-func (r *registryCaches) computeResourcesDataForServices() (map[string][]byte, error) {
-	var services []client.Object
-
-	for _, cache := range r.values.Caches {
-		service := computeResourcesDataForService(&cache)
-
-		services = append(services, service)
-	}
-
-	registry := managedresources.NewRegistry(kubernetes.ShootScheme, kubernetes.ShootCodec, kubernetes.ShootSerializer)
-
-	return registry.AddAllAndSerialize(services...)
-}
-
-func computeResourcesDataForService(cache *api.RegistryCache) *corev1.Service {
-	var (
-		upstreamLabel = computeUpstreamLabelValue(cache.Upstream)
-		name          = "registry-" + strings.ReplaceAll(upstreamLabel, ".", "-")
-		remoteURL     = ptr.Deref(cache.RemoteURL, registryutils.GetUpstreamURL(cache.Upstream))
-	)
-
-	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: metav1.NamespaceSystem,
-			Labels:    getLabels(name, upstreamLabel),
-			Annotations: map[string]string{
-				constants.UpstreamAnnotation:  cache.Upstream,
-				constants.RemoteURLAnnotation: remoteURL,
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: getLabels(name, upstreamLabel),
-			Ports: []corev1.ServicePort{{
-				Name:       "registry-cache",
-				Port:       constants.RegistryCachePort,
-				Protocol:   corev1.ProtocolTCP,
-				TargetPort: intstr.FromString("registry-cache"),
-			}},
-			Type: corev1.ServiceTypeClusterIP,
-		},
-	}
-
-	return service
-}
-
-func (r *registryCaches) fillProviderStatus(ctx context.Context) ([]corev1.Service, error) {
-	selector := labels.NewSelector()
-	requirement, err := labels.NewRequirement(constants.UpstreamHostLabel, selection.Exists, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create label selector: %w", err)
-	}
-	selector = selector.Add(*requirement)
-
-	// get all registry cache services
-	serviceList := &corev1.ServiceList{}
-	if err := r.shootClient.List(ctx, serviceList, client.InNamespace(metav1.NamespaceSystem), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return nil, fmt.Errorf("failed to read services from shoot: %w", err)
-	}
-
-	if len(serviceList.Items) != len(r.values.Caches) {
-		return nil, fmt.Errorf("not all services for all configured caches exist")
-	}
-
-	cacheStatuses := make([]v1alpha3.RegistryCacheStatus, 0, len(r.values.Caches))
-	for _, service := range serviceList.Items {
-		cacheStatuses = append(cacheStatuses, v1alpha3.RegistryCacheStatus{
-			Upstream:  service.Annotations[constants.UpstreamAnnotation],
-			Endpoint:  fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, constants.RegistryCachePort),
-			RemoteURL: service.Annotations[constants.RemoteURLAnnotation],
-		})
-	}
-
-	r.values.RegistryStatus.Caches = cacheStatuses
-
-	return serviceList.Items, nil
-}
-
-func getLabels(name, upstreamLabel string) map[string]string {
-	return map[string]string{
-		"app":                       name,
-		constants.UpstreamHostLabel: upstreamLabel,
-	}
-}
-
-// computeUpstreamLabelValue computes upstream-host label value by given upstream.
-//
-// Upstream is a valid DNS subdomain (RFC 1123) and optionally a port (e.g. my-registry.io[:5000])
-// It is used as an 'upstream-host' label value on registry cache resources (Service, Secret, StatefulSet and VPA).
-// Label values cannot contain ':' char, so if upstream is '<host>:<port>' the label value is transformed to '<host>-<port>'.
-// It is also used to build the resources names escaping the '.' with '-'; e.g. `registry-<escaped_upstreamLabel>`.
-//
-// Due to restrictions of resource names length, if upstream length > 43 it is truncated at 37 chars, and the
-// label value is transformed to <truncated-upstream>-<hash> where <hash> is first 5 chars of upstream sha256 hash.
-//
-// The returned upstreamLabel is at most 43 chars.
-func computeUpstreamLabelValue(upstream string) string {
-	// A label value length and a resource name length limits are 63 chars. However, Pods for a StatefulSet with name > 52 chars
-	// cannot be created due to https://github.com/kubernetes/kubernetes/issues/64023.
-	// The cache resources name have prefix 'registry-', thus the label value length is limited to 43.
-	const labelValueLimit = 43
-
-	upstreamLabel := strings.ReplaceAll(upstream, ":", "-")
-	if len(upstream) > labelValueLimit {
-		hash := utils.ComputeSHA256Hex([]byte(upstream))[:5]
-		limit := labelValueLimit - len(hash) - 1
-		upstreamLabel = fmt.Sprintf("%s-%s", upstreamLabel[:limit], hash)
-	}
-	return upstreamLabel
-}
-
-// removeServicesFromManagedResourceStatus removes all resources with kind=Service from the ManagedResources .status.resources field.
-//
-// TODO(dimitar-kostadinov): Clean up this function in v0.12.0.
-func (r *registryCaches) removeServicesFromManagedResourceStatus(ctx context.Context) error {
-	mr := &resourcesv1alpha1.ManagedResource{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      managedResourceName,
-			Namespace: r.namespace,
-		},
-	}
-	if err := r.client.Get(ctx, client.ObjectKeyFromObject(mr), mr); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	var updatedRefs []resourcesv1alpha1.ObjectReference
-	for _, objectRef := range mr.Status.Resources {
-		if objectRef.Kind != "Service" {
-			updatedRefs = append(updatedRefs, objectRef)
-		}
-	}
-	if len(updatedRefs) == len(mr.Status.Resources) {
-		// No changes, no need to patch. Exit early.
-		return nil
-	}
-
-	patch := client.MergeFrom(mr.DeepCopy())
-	mr.Status.Resources = updatedRefs
-	if err := r.client.Status().Patch(ctx, mr, patch); err != nil {
-		return fmt.Errorf("failed to update ManagedResource status: %w", err)
-	}
-
-	return nil
 }

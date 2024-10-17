@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package registry
+package component
 
 import (
 	"fmt"
@@ -12,15 +12,6 @@ import (
 	"github.com/gardener/gardener/pkg/utils"
 )
 
-// GetUpstreamURL returns the upstream URL by given upstream.
-func GetUpstreamURL(upstream string) string {
-	if upstream == "docker.io" {
-		return "https://registry-1.docker.io"
-	}
-
-	return "https://" + upstream
-}
-
 func GetLabels(name, upstreamLabel string) map[string]string {
 	return map[string]string{
 		"app":                       name,
@@ -28,7 +19,7 @@ func GetLabels(name, upstreamLabel string) map[string]string {
 	}
 }
 
-// ComputeUpstreamLabelValue computes upstream-host label value by given upstream.
+// computeUpstreamLabelValue computes upstream-host label value by given upstream.
 //
 // Upstream is a valid DNS subdomain (RFC 1123) and optionally a port (e.g. my-registry.io[:5000])
 // It is used as an 'upstream-host' label value on registry cache resources (Service, Secret, StatefulSet and VPA).
