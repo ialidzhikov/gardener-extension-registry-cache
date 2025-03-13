@@ -308,7 +308,8 @@ func (r *registryCaches) computeResourcesDataForRegistryCache(ctx context.Contex
 			Selector: &metav1.LabelSelector{
 				MatchLabels: registryutils.GetLabels(name, upstreamLabel),
 			},
-			Replicas: ptr.To[int32](1),
+			Replicas:             ptr.To[int32](1),
+			RevisionHistoryLimit: ptr.To[int32](2),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: utils.MergeStringMaps(registryutils.GetLabels(name, upstreamLabel), map[string]string{
