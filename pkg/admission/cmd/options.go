@@ -16,5 +16,6 @@ func GardenWebhookSwitchOptions() *webhookcmd.SwitchOptions {
 	return webhookcmd.NewSwitchOptions(
 		webhookcmd.Switch(cachevalidator.Name, cachevalidator.New),
 		webhookcmd.Switch(mirrorvalidator.Name, mirrorvalidator.New),
+		webhookcmd.Switch("secret-validator", cachevalidator.NewSecretsWebhook),
 	)
 }

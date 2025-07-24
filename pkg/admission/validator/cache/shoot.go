@@ -95,11 +95,11 @@ func (s *shoot) Validate(ctx context.Context, newObj, oldObj client.Object) erro
 
 	allErrs = append(allErrs, validation.ValidateRegistryConfig(registryConfig, providerConfigPath)...)
 
-	errList, err := s.validateRegistryCredentials(ctx, registryConfig, providerConfigPath, shoot.Spec.Resources, shoot.Namespace)
-	if err != nil {
-		return err
-	}
-	allErrs = append(allErrs, errList...)
+	// errList, err := s.validateRegistryCredentials(ctx, registryConfig, providerConfigPath, shoot.Spec.Resources, shoot.Namespace)
+	// if err != nil {
+	// 	return err
+	// }
+	// allErrs = append(allErrs, errList...)
 
 	return allErrs.ToAggregate()
 }
