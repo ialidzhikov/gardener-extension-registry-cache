@@ -1,5 +1,7 @@
 # Gardener Extension for Registry Cache
 
+<!-- test -->
+
 [![REUSE status](https://api.reuse.software/badge/github.com/gardener/gardener-extension-registry-cache)](https://api.reuse.software/info/github.com/gardener/gardener-extension-registry-cache)
 [![CI Build status](https://github.com/gardener/gardener-extension-registry-cache/actions/workflows/non-release.yaml/badge.svg)](https://github.com/gardener/gardener-extension-registry-cache/actions/workflows/non-release.yaml)
 
